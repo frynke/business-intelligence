@@ -11,9 +11,6 @@ const MODULE = "PRJREP";
 const IFS_PROJECTION_BASE_URL =
   "https://ifsc-cfg.xeam.se/main/ifsapplications/projection/v1";
 
-/**
- * Get an OAuth access token from IFS.
- */
 async function getAccessToken() {
   if (!IFS_TOKEN_URL || !IFS_CLIENT_ID || !IFS_CLIENT_SECRET) {
     throw new Error(
@@ -52,16 +49,10 @@ async function getAccessToken() {
   return tokenData.access_token;
 }
 
-/**
- * Format a UTC Date as YYYY-MM-DD.
- */
 function formatDate(date) {
   return date.toISOString().slice(0, 10);
 }
 
-/**
- * Return Monday for the week containing the supplied date.
- */
 function getMonday(date) {
   const result = new Date(date);
   const weekday = result.getUTCDay();
@@ -74,9 +65,6 @@ function getMonday(date) {
   return result;
 }
 
-/**
- * Return Sunday for the week beginning on the supplied Monday.
- */
 function getSunday(monday) {
   const sunday = new Date(monday);
   sunday.setUTCDate(sunday.getUTCDate() + 6);
@@ -84,9 +72,6 @@ function getSunday(monday) {
   return sunday;
 }
 
-/**
- * Add days to a UTC date.
- */
 function addDays(date, numberOfDays) {
   const result = new Date(date);
   result.setUTCDate(result.getUTCDate() + numberOfDays);
@@ -94,9 +79,6 @@ function addDays(date, numberOfDays) {
   return result;
 }
 
-/**
- * Make an authenticated GET request to IFS.
- */
 async function fetchFromIFS(url, accessToken, description) {
   console.log(`${description} URL:`, url);
 
@@ -121,9 +103,6 @@ async function fetchFromIFS(url, accessToken, description) {
   return Array.isArray(data.value) ? data.value : [];
 }
 
-/**
- * Build the IFS URL for one weekly time-registration data set.
- */
 function buildTimeUrl(monday) {
   const year = monday.getUTCFullYear();
   const month = monday.getUTCMonth() + 1;
@@ -141,12 +120,6 @@ function buildTimeUrl(monday) {
   );
 }
 
-/**
- * Build the IFS URL for projects.
- *
- * No project status or date filters are applied.
- * Historical projects must remain available for dashboard joins.
- */
 function buildProjectsUrl() {
   return (
     `${IFS_PROJECTION_BASE_URL}/` +
@@ -155,9 +128,6 @@ function buildProjectsUrl() {
   );
 }
 
-/**
- * Build the IFS URL for customers.
- */
 function buildCustomersUrl() {
   return (
     `${IFS_PROJECTION_BASE_URL}/` +
@@ -166,11 +136,6 @@ function buildCustomersUrl() {
   );
 }
 
-/**
- * Fetch time, projects and customers from IFS.
- *
- * The same access token is reused for all three requests.
- */
 async function fetchDashboardSourceData(monday) {
   const accessToken = await getAccessToken();
 
@@ -199,11 +164,6 @@ async function fetchDashboardSourceData(monday) {
   };
 }
 
-/**
- * Extract project ID from an activity short name.
- *
- * AFR-001.90.100 -> AFR-001
- */
 function getProjectId(activityShortName) {
   if (
     !activityShortName ||
@@ -215,9 +175,6 @@ function getProjectId(activityShortName) {
   return activityShortName.split(".")[0] || "Unknown";
 }
 
-/**
- * Convert weekly IFS rows into individual daily entries.
- */
 function convertRowsToDailyEntries(rows, monday) {
   const entries = [];
 
@@ -277,9 +234,6 @@ function convertRowsToDailyEntries(rows, monday) {
   return entries;
 }
 
-/**
- * Create project and customer lookup maps.
- */
 function buildMasterDataMaps(projects, customers) {
   const customerById = new Map();
 
@@ -323,9 +277,6 @@ function buildMasterDataMaps(projects, customers) {
   };
 }
 
-/**
- * Add customer information to every time entry.
- */
 function enrichEntriesWithCustomers(
   entries,
   projects,
@@ -344,6 +295,7 @@ function enrichEntriesWithCustomers(
         ...entry,
         customerId: null,
         customerName: "Unknown customer",
+        customerType: "unknown",
         customerMappingStatus: "project-not-found",
       };
     }
@@ -353,6 +305,7 @@ function enrichEntriesWithCustomers(
         ...entry,
         customerId: null,
         customerName: "Internal / no customer",
+        customerType: "internal",
         customerMappingStatus: "project-has-no-customer",
       };
     }
@@ -362,6 +315,7 @@ function enrichEntriesWithCustomers(
         ...entry,
         customerId: project.customerId,
         customerName: "Unknown customer",
+        customerType: "unknown",
         customerMappingStatus: "customer-not-found",
       };
     }
@@ -370,14 +324,12 @@ function enrichEntriesWithCustomers(
       ...entry,
       customerId: project.customerId,
       customerName: project.customerName,
+      customerType: "customer",
       customerMappingStatus: "mapped",
     };
   });
 }
 
-/**
- * Aggregate total hours by date.
- */
 function aggregateDailyHours(entries, monday) {
   const totalsByDate = new Map();
 
@@ -401,9 +353,6 @@ function aggregateDailyHours(entries, monday) {
   );
 }
 
-/**
- * Aggregate hours by reporting code.
- */
 function aggregateByReportingCode(entries, totalHours) {
   const groups = new Map();
 
@@ -434,9 +383,6 @@ function aggregateByReportingCode(entries, totalHours) {
     .sort((a, b) => b.hours - a.hours);
 }
 
-/**
- * Aggregate hours by project.
- */
 function aggregateByProject(entries, totalHours) {
   const groups = new Map();
 
@@ -449,6 +395,7 @@ function aggregateByProject(entries, totalHours) {
         projectLabel: entry.activityLabel,
         customerId: entry.customerId,
         customerName: entry.customerName,
+        customerType: entry.customerType,
         hours: 0,
       });
     }
@@ -470,8 +417,129 @@ function aggregateByProject(entries, totalHours) {
 }
 
 /**
- * Produce diagnostics for entries that could not be fully mapped.
+ * KPI 1: Hours by customer.
+ *
+ * Only entries mapped to an actual customer are included here.
+ * Internal and unknown entries are handled separately.
  */
+function aggregateByCustomer(entries, customerHours) {
+  const groups = new Map();
+
+  for (const entry of entries) {
+    if (entry.customerType !== "customer") {
+      continue;
+    }
+
+    const key = entry.customerId;
+
+    if (!groups.has(key)) {
+      groups.set(key, {
+        customerId: entry.customerId,
+        customerName: entry.customerName,
+        hours: 0,
+      });
+    }
+
+    groups.get(key).hours += entry.hours;
+  }
+
+  return Array.from(groups.values())
+    .map((group) => ({
+      ...group,
+      percentage:
+        customerHours > 0
+          ? Number(
+              ((group.hours / customerHours) * 100).toFixed(1)
+            )
+          : 0,
+    }))
+    .sort((a, b) => b.hours - a.hours);
+}
+
+/**
+ * KPI 3: Customer utilization.
+ *
+ * Unknown hours are excluded from the utilization denominator because
+ * they cannot yet be reliably classified as customer or internal.
+ */
+function calculateUtilization(entries) {
+  let customerHours = 0;
+  let internalHours = 0;
+  let unknownHours = 0;
+
+  for (const entry of entries) {
+    if (entry.customerType === "customer") {
+      customerHours += entry.hours;
+    } else if (entry.customerType === "internal") {
+      internalHours += entry.hours;
+    } else {
+      unknownHours += entry.hours;
+    }
+  }
+
+  const classifiedHours = customerHours + internalHours;
+
+  const customerUtilization =
+    classifiedHours > 0
+      ? Number(
+          ((customerHours / classifiedHours) * 100).toFixed(1)
+        )
+      : 0;
+
+  return {
+    customerHours,
+    internalHours,
+    unknownHours,
+    classifiedHours,
+    customerUtilization,
+  };
+}
+
+/**
+ * KPI 6: Customer concentration.
+ *
+ * Percentages are calculated against total customer hours,
+ * not total reported hours.
+ */
+function calculateCustomerConcentration(hoursByCustomer) {
+  const customerHours = hoursByCustomer.reduce(
+    (total, customer) => total + customer.hours,
+    0
+  );
+
+  const sumTopCustomers = (count) =>
+    hoursByCustomer
+      .slice(0, count)
+      .reduce(
+        (total, customer) => total + customer.hours,
+        0
+      );
+
+  const toPercentage = (hours) =>
+    customerHours > 0
+      ? Number(((hours / customerHours) * 100).toFixed(1))
+      : 0;
+
+  const largestCustomer = hoursByCustomer[0] || null;
+
+  return {
+    largestCustomerId: largestCustomer?.customerId || null,
+    largestCustomerName:
+      largestCustomer?.customerName || null,
+    largestCustomerHours: largestCustomer?.hours || 0,
+    largestCustomerPercentage:
+      largestCustomer?.percentage || 0,
+
+    top3Hours: sumTopCustomers(3),
+    top3Percentage: toPercentage(sumTopCustomers(3)),
+
+    top5Hours: sumTopCustomers(5),
+    top5Percentage: toPercentage(sumTopCustomers(5)),
+
+    customerCount: hoursByCustomer.length,
+  };
+}
+
 function buildCustomerMappingDiagnostics(entries) {
   const unmappedProjects = new Map();
 
@@ -558,6 +626,9 @@ export default async function handler(req, res) {
       0
     );
 
+    const utilization =
+      calculateUtilization(dailyEntries);
+
     const dailyHours = aggregateDailyHours(
       dailyEntries,
       monday
@@ -574,6 +645,16 @@ export default async function handler(req, res) {
       totalHours
     );
 
+    const hoursByCustomer = aggregateByCustomer(
+      dailyEntries,
+      utilization.customerHours
+    );
+
+    const customerConcentration =
+      calculateCustomerConcentration(
+        hoursByCustomer
+      );
+
     const customerMappingIssues =
       buildCustomerMappingDiagnostics(dailyEntries);
 
@@ -583,7 +664,7 @@ export default async function handler(req, res) {
     );
 
     return res.status(200).json({
-      version: "time-intelligence-api-v4",
+      version: "time-intelligence-api-v5",
 
       period: {
         type: "this-week",
@@ -599,17 +680,33 @@ export default async function handler(req, res) {
 
       summary: {
         totalHours,
+
+        customerHours: utilization.customerHours,
+        internalHours: utilization.internalHours,
+        unknownHours: utilization.unknownHours,
+        classifiedHours: utilization.classifiedHours,
+
+        customerUtilization:
+          utilization.customerUtilization,
+
         numberOfTimeEntries: dailyEntries.length,
         projectsWithReportedHours: hoursByProject.length,
         reportingCodesUsed: hoursByReportingCode.length,
-        entriesWithCustomerMapping: mappedEntries.length,
+        customersWithReportedHours:
+          hoursByCustomer.length,
+
+        entriesWithCustomerMapping:
+          mappedEntries.length,
+
         entriesWithoutCustomerMapping:
           dailyEntries.length - mappedEntries.length,
       },
 
       dailyHours,
+      hoursByCustomer,
       hoursByReportingCode,
       hoursByProject,
+      customerConcentration,
 
       diagnostics: {
         rawTimeRowCount: timeRows.length,
@@ -624,7 +721,7 @@ export default async function handler(req, res) {
     console.error("GET /api/dashboard failed:", error);
 
     return res.status(500).json({
-      version: "time-intelligence-api-v4",
+      version: "time-intelligence-api-v5",
       error: "Failed to generate dashboard data",
       details:
         error instanceof Error
