@@ -12,7 +12,7 @@ const IFS_PROJECTION_BASE_URL =
   "https://ifsc-cfg.xeam.se/main/ifsapplications/projection/v1";
 
 /**
- * Get an OAuth token from IFS.
+ * Get an OAuth access token from IFS.
  */
 async function getAccessToken() {
   if (!IFS_TOKEN_URL || !IFS_CLIENT_ID || !IFS_CLIENT_SECRET) {
@@ -66,7 +66,6 @@ function getMonday(date) {
   const result = new Date(date);
   const weekday = result.getUTCDay();
 
-  // Sunday = 0, Monday = 1, ..., Saturday = 6
   const daysSinceMonday = weekday === 0 ? 6 : weekday - 1;
 
   result.setUTCDate(result.getUTCDate() - daysSinceMonday);
@@ -96,9 +95,36 @@ function addDays(date, numberOfDays) {
 }
 
 /**
- * Build the IFS URL for one weekly time-registration record set.
+ * Make an authenticated GET request to IFS.
  */
-function buildIfsUrl(monday) {
+async function fetchFromIFS(url, accessToken, description) {
+  console.log(`${description} URL:`, url);
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json",
+    },
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+
+    throw new Error(
+      `${description} failed: ${response.status} ${errorText}`
+    );
+  }
+
+  const data = await response.json();
+
+  return Array.isArray(data.value) ? data.value : [];
+}
+
+/**
+ * Build the IFS URL for one weekly time-registration data set.
+ */
+function buildTimeUrl(monday) {
   const year = monday.getUTCFullYear();
   const month = monday.getUTCMonth() + 1;
   const day = monday.getUTCDate();
@@ -116,39 +142,66 @@ function buildIfsUrl(monday) {
 }
 
 /**
- * Fetch one complete week from IFS.
+ * Build the IFS URL for projects.
+ *
+ * No project status or date filters are applied.
+ * Historical projects must remain available for dashboard joins.
  */
-async function fetchWeekFromIFS(monday) {
-  const accessToken = await getAccessToken();
-  const ifsUrl = buildIfsUrl(monday);
-
-  console.log("IFS dashboard week URL:", ifsUrl);
-
-  const response = await fetch(ifsUrl, {
-    method: "GET",
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: "application/json",
-    },
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-
-    throw new Error(
-      `IFS dashboard request failed: ${response.status} ${errorText}`
-    );
-  }
-
-  const data = await response.json();
-
-  return Array.isArray(data.value) ? data.value : [];
+function buildProjectsUrl() {
+  return (
+    `${IFS_PROJECTION_BASE_URL}/` +
+    "ProjectDefinitionHandling.svc/Projects" +
+    "?$select=ProjectId,CustomerId"
+  );
 }
 
 /**
- * Extract the project ID from an activity short name.
+ * Build the IFS URL for customers.
+ */
+function buildCustomersUrl() {
+  return (
+    `${IFS_PROJECTION_BASE_URL}/` +
+    "CustomerHandling.svc/CustomerInfoSet" +
+    "?$select=CustomerId,Name"
+  );
+}
+
+/**
+ * Fetch time, projects and customers from IFS.
  *
- * Example:
+ * The same access token is reused for all three requests.
+ */
+async function fetchDashboardSourceData(monday) {
+  const accessToken = await getAccessToken();
+
+  const [timeRows, projects, customers] = await Promise.all([
+    fetchFromIFS(
+      buildTimeUrl(monday),
+      accessToken,
+      "IFS dashboard time request"
+    ),
+    fetchFromIFS(
+      buildProjectsUrl(),
+      accessToken,
+      "IFS project request"
+    ),
+    fetchFromIFS(
+      buildCustomersUrl(),
+      accessToken,
+      "IFS customer request"
+    ),
+  ]);
+
+  return {
+    timeRows,
+    projects,
+    customers,
+  };
+}
+
+/**
+ * Extract project ID from an activity short name.
+ *
  * AFR-001.90.100 -> AFR-001
  */
 function getProjectId(activityShortName) {
@@ -225,6 +278,104 @@ function convertRowsToDailyEntries(rows, monday) {
 }
 
 /**
+ * Create project and customer lookup maps.
+ */
+function buildMasterDataMaps(projects, customers) {
+  const customerById = new Map();
+
+  for (const customer of customers) {
+    if (!customer.CustomerId) {
+      continue;
+    }
+
+    customerById.set(String(customer.CustomerId), {
+      customerId: String(customer.CustomerId),
+      customerName:
+        customer.Name || `Customer ${customer.CustomerId}`,
+    });
+  }
+
+  const projectById = new Map();
+
+  for (const project of projects) {
+    if (!project.ProjectId) {
+      continue;
+    }
+
+    const customerId = project.CustomerId
+      ? String(project.CustomerId)
+      : null;
+
+    const customer = customerId
+      ? customerById.get(customerId)
+      : null;
+
+    projectById.set(String(project.ProjectId), {
+      projectId: String(project.ProjectId),
+      customerId,
+      customerName: customer?.customerName || null,
+    });
+  }
+
+  return {
+    projectById,
+    customerById,
+  };
+}
+
+/**
+ * Add customer information to every time entry.
+ */
+function enrichEntriesWithCustomers(
+  entries,
+  projects,
+  customers
+) {
+  const { projectById } = buildMasterDataMaps(
+    projects,
+    customers
+  );
+
+  return entries.map((entry) => {
+    const project = projectById.get(entry.projectId);
+
+    if (!project) {
+      return {
+        ...entry,
+        customerId: null,
+        customerName: "Unknown customer",
+        customerMappingStatus: "project-not-found",
+      };
+    }
+
+    if (!project.customerId) {
+      return {
+        ...entry,
+        customerId: null,
+        customerName: "Internal / no customer",
+        customerMappingStatus: "project-has-no-customer",
+      };
+    }
+
+    if (!project.customerName) {
+      return {
+        ...entry,
+        customerId: project.customerId,
+        customerName: "Unknown customer",
+        customerMappingStatus: "customer-not-found",
+      };
+    }
+
+    return {
+      ...entry,
+      customerId: project.customerId,
+      customerName: project.customerName,
+      customerMappingStatus: "mapped",
+    };
+  });
+}
+
+/**
  * Aggregate total hours by date.
  */
 function aggregateDailyHours(entries, monday) {
@@ -296,6 +447,8 @@ function aggregateByProject(entries, totalHours) {
       groups.set(key, {
         projectId: entry.projectId,
         projectLabel: entry.activityLabel,
+        customerId: entry.customerId,
+        customerName: entry.customerName,
         hours: 0,
       });
     }
@@ -314,6 +467,35 @@ function aggregateByProject(entries, totalHours) {
           : 0,
     }))
     .sort((a, b) => b.hours - a.hours);
+}
+
+/**
+ * Produce diagnostics for entries that could not be fully mapped.
+ */
+function buildCustomerMappingDiagnostics(entries) {
+  const unmappedProjects = new Map();
+
+  for (const entry of entries) {
+    if (entry.customerMappingStatus === "mapped") {
+      continue;
+    }
+
+    const key = `${entry.projectId}-${entry.customerMappingStatus}`;
+
+    if (!unmappedProjects.has(key)) {
+      unmappedProjects.set(key, {
+        projectId: entry.projectId,
+        status: entry.customerMappingStatus,
+        hours: 0,
+      });
+    }
+
+    unmappedProjects.get(key).hours += entry.hours;
+  }
+
+  return Array.from(unmappedProjects.values()).sort(
+    (a, b) => b.hours - a.hours
+  );
 }
 
 export default async function handler(req, res) {
@@ -354,10 +536,21 @@ export default async function handler(req, res) {
     const monday = getMonday(now);
     const sunday = getSunday(monday);
 
-    const rows = await fetchWeekFromIFS(monday);
-    const dailyEntries = convertRowsToDailyEntries(
-      rows,
+    const {
+      timeRows,
+      projects,
+      customers,
+    } = await fetchDashboardSourceData(monday);
+
+    const rawDailyEntries = convertRowsToDailyEntries(
+      timeRows,
       monday
+    );
+
+    const dailyEntries = enrichEntriesWithCustomers(
+      rawDailyEntries,
+      projects,
+      customers
     );
 
     const totalHours = dailyEntries.reduce(
@@ -381,8 +574,16 @@ export default async function handler(req, res) {
       totalHours
     );
 
+    const customerMappingIssues =
+      buildCustomerMappingDiagnostics(dailyEntries);
+
+    const mappedEntries = dailyEntries.filter(
+      (entry) =>
+        entry.customerMappingStatus === "mapped"
+    );
+
     return res.status(200).json({
-      version: "time-intelligence-api-v3",
+      version: "time-intelligence-api-v4",
 
       period: {
         type: "this-week",
@@ -400,8 +601,10 @@ export default async function handler(req, res) {
         totalHours,
         numberOfTimeEntries: dailyEntries.length,
         projectsWithReportedHours: hoursByProject.length,
-        reportingCodesUsed:
-          hoursByReportingCode.length,
+        reportingCodesUsed: hoursByReportingCode.length,
+        entriesWithCustomerMapping: mappedEntries.length,
+        entriesWithoutCustomerMapping:
+          dailyEntries.length - mappedEntries.length,
       },
 
       dailyHours,
@@ -409,7 +612,10 @@ export default async function handler(req, res) {
       hoursByProject,
 
       diagnostics: {
-        rawRowCount: rows.length,
+        rawTimeRowCount: timeRows.length,
+        projectMasterDataCount: projects.length,
+        customerMasterDataCount: customers.length,
+        customerMappingIssues,
       },
 
       dailyEntries,
@@ -418,7 +624,7 @@ export default async function handler(req, res) {
     console.error("GET /api/dashboard failed:", error);
 
     return res.status(500).json({
-      version: "time-intelligence-api-v3",
+      version: "time-intelligence-api-v4",
       error: "Failed to generate dashboard data",
       details:
         error instanceof Error
