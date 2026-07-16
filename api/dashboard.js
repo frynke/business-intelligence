@@ -53,6 +53,10 @@ function formatDate(date) {
   return date.toISOString().slice(0, 10);
 }
 
+function createUtcDate(year, monthIndex, day) {
+  return new Date(Date.UTC(year, monthIndex, day));
+}
+
 function getMonday(date) {
   const result = new Date(date);
   const weekday = result.getUTCDay();
@@ -66,10 +70,7 @@ function getMonday(date) {
 }
 
 function getSunday(monday) {
-  const sunday = new Date(monday);
-  sunday.setUTCDate(sunday.getUTCDate() + 6);
-
-  return sunday;
+  return addDays(monday, 6);
 }
 
 function addDays(date, numberOfDays) {
@@ -77,6 +78,57 @@ function addDays(date, numberOfDays) {
   result.setUTCDate(result.getUTCDate() + numberOfDays);
 
   return result;
+}
+
+function isDateWithinRange(date, from, to) {
+  return date >= from && date <= to;
+}
+
+function getPeriodRange(period, now = new Date()) {
+  if (period === "this-week") {
+    const from = getMonday(now);
+    const to = getSunday(from);
+
+    return {
+      type: period,
+      from,
+      to,
+    };
+  }
+
+  if (period === "this-month") {
+    const year = now.getUTCFullYear();
+    const monthIndex = now.getUTCMonth();
+
+    const from = createUtcDate(year, monthIndex, 1);
+    const to = createUtcDate(year, monthIndex + 1, 0);
+
+    return {
+      type: period,
+      from,
+      to,
+    };
+  }
+
+  throw new Error(`Unsupported period: ${period}`);
+}
+
+/**
+ * Return every Monday whose IFS week overlaps the selected period.
+ *
+ * A month may require weeks beginning in the previous month
+ * or ending in the following month.
+ */
+function getRequiredMondays(from, to) {
+  const mondays = [];
+  let currentMonday = getMonday(from);
+
+  while (currentMonday <= to) {
+    mondays.push(new Date(currentMonday));
+    currentMonday = addDays(currentMonday, 7);
+  }
+
+  return mondays;
 }
 
 async function fetchFromIFS(url, accessToken, description) {
@@ -136,20 +188,29 @@ function buildCustomersUrl() {
   );
 }
 
-async function fetchDashboardSourceData(monday) {
+async function fetchDashboardSourceData(mondays) {
   const accessToken = await getAccessToken();
 
-  const [timeRows, projects, customers] = await Promise.all([
+  const timeRequests = mondays.map((monday) =>
     fetchFromIFS(
       buildTimeUrl(monday),
       accessToken,
-      "IFS dashboard time request"
-    ),
+      `IFS time request for week ${formatDate(monday)}`
+    ).then((rows) => ({
+      monday,
+      rows,
+    }))
+  );
+
+  const [weeks, projects, customers] = await Promise.all([
+    Promise.all(timeRequests),
+
     fetchFromIFS(
       buildProjectsUrl(),
       accessToken,
       "IFS project request"
     ),
+
     fetchFromIFS(
       buildCustomersUrl(),
       accessToken,
@@ -158,7 +219,7 @@ async function fetchDashboardSourceData(monday) {
   ]);
 
   return {
-    timeRows,
+    weeks,
     projects,
     customers,
   };
@@ -175,11 +236,28 @@ function getProjectId(activityShortName) {
   return activityShortName.split(".")[0] || "Unknown";
 }
 
-function convertRowsToDailyEntries(rows, monday) {
+function convertWeekRowsToDailyEntries(
+  rows,
+  monday,
+  periodFrom,
+  periodTo
+) {
   const entries = [];
 
   for (const row of rows) {
     for (let dayNumber = 1; dayNumber <= 7; dayNumber += 1) {
+      const entryDate = addDays(monday, dayNumber - 1);
+
+      if (
+        !isDateWithinRange(
+          entryDate,
+          periodFrom,
+          periodTo
+        )
+      ) {
+        continue;
+      }
+
       const hoursField = `HoursDay${dayNumber}`;
       const transactionCountField =
         `NumberOfTransDay${dayNumber}`;
@@ -192,13 +270,14 @@ function convertRowsToDailyEntries(rows, monday) {
         continue;
       }
 
-      const entryDate = addDays(monday, dayNumber - 1);
       const activityShortName = row.Col1 || null;
 
       entries.push({
         id:
           row[objidField] ||
-          `${row.CompanyId}-${row.EmpNo}-${row.ModuleRowNo}-${dayNumber}`,
+          `${row.CompanyId}-${row.EmpNo}-${row.ModuleRowNo}-${formatDate(
+            entryDate
+          )}`,
 
         date: formatDate(entryDate),
 
@@ -217,7 +296,8 @@ function convertRowsToDailyEntries(rows, monday) {
         reportingCodeDescription:
           row.JobDetailLabel || row.Col2 || "Unknown",
 
-        organizationCode: row.OrgCode || row.Col3 || null,
+        organizationCode:
+          row.OrgCode || row.Col3 || null,
 
         hours,
 
@@ -232,6 +312,21 @@ function convertRowsToDailyEntries(rows, monday) {
   }
 
   return entries;
+}
+
+function convertWeeksToDailyEntries(
+  weeks,
+  periodFrom,
+  periodTo
+) {
+  return weeks.flatMap(({ monday, rows }) =>
+    convertWeekRowsToDailyEntries(
+      rows,
+      monday,
+      periodFrom,
+      periodTo
+    )
+  );
 }
 
 function buildMasterDataMaps(projects, customers) {
@@ -273,7 +368,6 @@ function buildMasterDataMaps(projects, customers) {
 
   return {
     projectById,
-    customerById,
   };
 }
 
@@ -330,12 +424,14 @@ function enrichEntriesWithCustomers(
   });
 }
 
-function aggregateDailyHours(entries, monday) {
+function aggregateDailyHours(entries, periodFrom, periodTo) {
   const totalsByDate = new Map();
 
-  for (let dayOffset = 0; dayOffset < 7; dayOffset += 1) {
-    const date = formatDate(addDays(monday, dayOffset));
-    totalsByDate.set(date, 0);
+  let currentDate = new Date(periodFrom);
+
+  while (currentDate <= periodTo) {
+    totalsByDate.set(formatDate(currentDate), 0);
+    currentDate = addDays(currentDate, 1);
   }
 
   for (const entry of entries) {
@@ -416,12 +512,6 @@ function aggregateByProject(entries, totalHours) {
     .sort((a, b) => b.hours - a.hours);
 }
 
-/**
- * KPI 1: Hours by customer.
- *
- * Only entries mapped to an actual customer are included here.
- * Internal and unknown entries are handled separately.
- */
 function aggregateByCustomer(entries, customerHours) {
   const groups = new Map();
 
@@ -456,12 +546,6 @@ function aggregateByCustomer(entries, customerHours) {
     .sort((a, b) => b.hours - a.hours);
 }
 
-/**
- * KPI 3: Customer utilization.
- *
- * Unknown hours are excluded from the utilization denominator because
- * they cannot yet be reliably classified as customer or internal.
- */
 function calculateUtilization(entries) {
   let customerHours = 0;
   let internalHours = 0;
@@ -477,12 +561,16 @@ function calculateUtilization(entries) {
     }
   }
 
-  const classifiedHours = customerHours + internalHours;
+  const classifiedHours =
+    customerHours + internalHours;
 
   const customerUtilization =
     classifiedHours > 0
       ? Number(
-          ((customerHours / classifiedHours) * 100).toFixed(1)
+          (
+            (customerHours / classifiedHours) *
+            100
+          ).toFixed(1)
         )
       : 0;
 
@@ -495,15 +583,12 @@ function calculateUtilization(entries) {
   };
 }
 
-/**
- * KPI 6: Customer concentration.
- *
- * Percentages are calculated against total customer hours,
- * not total reported hours.
- */
-function calculateCustomerConcentration(hoursByCustomer) {
+function calculateCustomerConcentration(
+  hoursByCustomer
+) {
   const customerHours = hoursByCustomer.reduce(
-    (total, customer) => total + customer.hours,
+    (total, customer) =>
+      total + customer.hours,
     0
   );
 
@@ -511,30 +596,42 @@ function calculateCustomerConcentration(hoursByCustomer) {
     hoursByCustomer
       .slice(0, count)
       .reduce(
-        (total, customer) => total + customer.hours,
+        (total, customer) =>
+          total + customer.hours,
         0
       );
 
   const toPercentage = (hours) =>
     customerHours > 0
-      ? Number(((hours / customerHours) * 100).toFixed(1))
+      ? Number(
+          ((hours / customerHours) * 100).toFixed(1)
+        )
       : 0;
 
-  const largestCustomer = hoursByCustomer[0] || null;
+  const largestCustomer =
+    hoursByCustomer[0] || null;
+
+  const top3Hours = sumTopCustomers(3);
+  const top5Hours = sumTopCustomers(5);
 
   return {
-    largestCustomerId: largestCustomer?.customerId || null,
+    largestCustomerId:
+      largestCustomer?.customerId || null,
+
     largestCustomerName:
       largestCustomer?.customerName || null,
-    largestCustomerHours: largestCustomer?.hours || 0,
+
+    largestCustomerHours:
+      largestCustomer?.hours || 0,
+
     largestCustomerPercentage:
       largestCustomer?.percentage || 0,
 
-    top3Hours: sumTopCustomers(3),
-    top3Percentage: toPercentage(sumTopCustomers(3)),
+    top3Hours,
+    top3Percentage: toPercentage(top3Hours),
 
-    top5Hours: sumTopCustomers(5),
-    top5Percentage: toPercentage(sumTopCustomers(5)),
+    top5Hours,
+    top5Percentage: toPercentage(top5Hours),
 
     customerCount: hoursByCustomer.length,
   };
@@ -548,7 +645,9 @@ function buildCustomerMappingDiagnostics(entries) {
       continue;
     }
 
-    const key = `${entry.projectId}-${entry.customerMappingStatus}`;
+    const key =
+      `${entry.projectId}-` +
+      `${entry.customerMappingStatus}`;
 
     if (!unmappedProjects.has(key)) {
       unmappedProjects.set(key, {
@@ -561,14 +660,17 @@ function buildCustomerMappingDiagnostics(entries) {
     unmappedProjects.get(key).hours += entry.hours;
   }
 
-  return Array.from(unmappedProjects.values()).sort(
-    (a, b) => b.hours - a.hours
-  );
+  return Array.from(
+    unmappedProjects.values()
+  ).sort((a, b) => b.hours - a.hours);
 }
 
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET, OPTIONS"
+  );
   res.setHeader(
     "Access-Control-Allow-Headers",
     "Content-Type"
@@ -591,38 +693,51 @@ export default async function handler(req, res) {
   }
 
   try {
-    const period = req.query.period || "this-week";
+    const period =
+      req.query.period || "this-week";
 
-    if (period !== "this-week") {
+    if (
+      period !== "this-week" &&
+      period !== "this-month"
+    ) {
       return res.status(400).json({
         error: "Unsupported period",
-        supportedPeriods: ["this-week"],
+        supportedPeriods: [
+          "this-week",
+          "this-month",
+        ],
       });
     }
 
-    const now = new Date();
-    const monday = getMonday(now);
-    const sunday = getSunday(monday);
+    const periodRange = getPeriodRange(period);
+    const mondays = getRequiredMondays(
+      periodRange.from,
+      periodRange.to
+    );
 
     const {
-      timeRows,
+      weeks,
       projects,
       customers,
-    } = await fetchDashboardSourceData(monday);
+    } = await fetchDashboardSourceData(mondays);
 
-    const rawDailyEntries = convertRowsToDailyEntries(
-      timeRows,
-      monday
-    );
+    const rawDailyEntries =
+      convertWeeksToDailyEntries(
+        weeks,
+        periodRange.from,
+        periodRange.to
+      );
 
-    const dailyEntries = enrichEntriesWithCustomers(
-      rawDailyEntries,
-      projects,
-      customers
-    );
+    const dailyEntries =
+      enrichEntriesWithCustomers(
+        rawDailyEntries,
+        projects,
+        customers
+      );
 
     const totalHours = dailyEntries.reduce(
-      (total, entry) => total + entry.hours,
+      (total, entry) =>
+        total + entry.hours,
       0
     );
 
@@ -631,7 +746,8 @@ export default async function handler(req, res) {
 
     const dailyHours = aggregateDailyHours(
       dailyEntries,
-      monday
+      periodRange.from,
+      periodRange.to
     );
 
     const hoursByReportingCode =
@@ -640,15 +756,17 @@ export default async function handler(req, res) {
         totalHours
       );
 
-    const hoursByProject = aggregateByProject(
-      dailyEntries,
-      totalHours
-    );
+    const hoursByProject =
+      aggregateByProject(
+        dailyEntries,
+        totalHours
+      );
 
-    const hoursByCustomer = aggregateByCustomer(
-      dailyEntries,
-      utilization.customerHours
-    );
+    const hoursByCustomer =
+      aggregateByCustomer(
+        dailyEntries,
+        utilization.customerHours
+      );
 
     const customerConcentration =
       calculateCustomerConcentration(
@@ -656,20 +774,30 @@ export default async function handler(req, res) {
       );
 
     const customerMappingIssues =
-      buildCustomerMappingDiagnostics(dailyEntries);
+      buildCustomerMappingDiagnostics(
+        dailyEntries
+      );
 
-    const mappedEntries = dailyEntries.filter(
-      (entry) =>
-        entry.customerMappingStatus === "mapped"
+    const mappedEntries =
+      dailyEntries.filter(
+        (entry) =>
+          entry.customerMappingStatus ===
+          "mapped"
+      );
+
+    const rawTimeRowCount = weeks.reduce(
+      (total, week) =>
+        total + week.rows.length,
+      0
     );
 
     return res.status(200).json({
-      version: "time-intelligence-api-v5",
+      version: "time-intelligence-api-v6",
 
       period: {
-        type: "this-week",
-        from: formatDate(monday),
-        to: formatDate(sunday),
+        type: periodRange.type,
+        from: formatDate(periodRange.from),
+        to: formatDate(periodRange.to),
       },
 
       filters: {
@@ -681,17 +809,30 @@ export default async function handler(req, res) {
       summary: {
         totalHours,
 
-        customerHours: utilization.customerHours,
-        internalHours: utilization.internalHours,
-        unknownHours: utilization.unknownHours,
-        classifiedHours: utilization.classifiedHours,
+        customerHours:
+          utilization.customerHours,
+
+        internalHours:
+          utilization.internalHours,
+
+        unknownHours:
+          utilization.unknownHours,
+
+        classifiedHours:
+          utilization.classifiedHours,
 
         customerUtilization:
           utilization.customerUtilization,
 
-        numberOfTimeEntries: dailyEntries.length,
-        projectsWithReportedHours: hoursByProject.length,
-        reportingCodesUsed: hoursByReportingCode.length,
+        numberOfTimeEntries:
+          dailyEntries.length,
+
+        projectsWithReportedHours:
+          hoursByProject.length,
+
+        reportingCodesUsed:
+          hoursByReportingCode.length,
+
         customersWithReportedHours:
           hoursByCustomer.length,
 
@@ -699,7 +840,8 @@ export default async function handler(req, res) {
           mappedEntries.length,
 
         entriesWithoutCustomerMapping:
-          dailyEntries.length - mappedEntries.length,
+          dailyEntries.length -
+          mappedEntries.length,
       },
 
       dailyHours,
@@ -709,19 +851,33 @@ export default async function handler(req, res) {
       customerConcentration,
 
       diagnostics: {
-        rawTimeRowCount: timeRows.length,
-        projectMasterDataCount: projects.length,
-        customerMasterDataCount: customers.length,
+        requestedWeekCount: mondays.length,
+
+        requestedWeeks: mondays.map(
+          formatDate
+        ),
+
+        rawTimeRowCount,
+
+        projectMasterDataCount:
+          projects.length,
+
+        customerMasterDataCount:
+          customers.length,
+
         customerMappingIssues,
       },
 
       dailyEntries,
     });
   } catch (error) {
-    console.error("GET /api/dashboard failed:", error);
+    console.error(
+      "GET /api/dashboard failed:",
+      error
+    );
 
     return res.status(500).json({
-      version: "time-intelligence-api-v5",
+      version: "time-intelligence-api-v6",
       error: "Failed to generate dashboard data",
       details:
         error instanceof Error
