@@ -60,7 +60,6 @@ function createUtcDate(year, monthIndex, day) {
 function getMonday(date) {
   const result = new Date(date);
   const weekday = result.getUTCDay();
-
   const daysSinceMonday = weekday === 0 ? 6 : weekday - 1;
 
   result.setUTCDate(result.getUTCDate() - daysSinceMonday);
@@ -69,15 +68,15 @@ function getMonday(date) {
   return result;
 }
 
-function getSunday(monday) {
-  return addDays(monday, 6);
-}
-
 function addDays(date, numberOfDays) {
   const result = new Date(date);
   result.setUTCDate(result.getUTCDate() + numberOfDays);
 
   return result;
+}
+
+function getSunday(monday) {
+  return addDays(monday, 6);
 }
 
 function isDateWithinRange(date, from, to) {
@@ -100,25 +99,16 @@ function getPeriodRange(period, now = new Date()) {
     const year = now.getUTCFullYear();
     const monthIndex = now.getUTCMonth();
 
-    const from = createUtcDate(year, monthIndex, 1);
-    const to = createUtcDate(year, monthIndex + 1, 0);
-
     return {
       type: period,
-      from,
-      to,
+      from: createUtcDate(year, monthIndex, 1),
+      to: createUtcDate(year, monthIndex + 1, 0),
     };
   }
 
   throw new Error(`Unsupported period: ${period}`);
 }
 
-/**
- * Return every Monday whose IFS week overlaps the selected period.
- *
- * A month may require weeks beginning in the previous month
- * or ending in the following month.
- */
 function getRequiredMondays(from, to) {
   const mondays = [];
   let currentMonday = getMonday(from);
@@ -248,13 +238,7 @@ function convertWeekRowsToDailyEntries(
     for (let dayNumber = 1; dayNumber <= 7; dayNumber += 1) {
       const entryDate = addDays(monday, dayNumber - 1);
 
-      if (
-        !isDateWithinRange(
-          entryDate,
-          periodFrom,
-          periodTo
-        )
-      ) {
+      if (!isDateWithinRange(entryDate, periodFrom, periodTo)) {
         continue;
       }
 
@@ -426,7 +410,6 @@ function enrichEntriesWithCustomers(
 
 function aggregateDailyHours(entries, periodFrom, periodTo) {
   const totalsByDate = new Map();
-
   let currentDate = new Date(periodFrom);
 
   while (currentDate <= periodTo) {
@@ -665,6 +648,30 @@ function buildCustomerMappingDiagnostics(entries) {
   ).sort((a, b) => b.hours - a.hours);
 }
 
+function buildExecutiveBrief(period, summary) {
+  const title =
+    period.type === "this-week"
+      ? "This week"
+      : "This month";
+
+  return {
+    title,
+
+    lines: [
+      `${summary.totalHours} reported hours`,
+      `across ${summary.customersWithReportedHours} customers`,
+      `on ${summary.projectsWithReportedHours} projects`,
+      `with ${summary.customerUtilization}% customer utilization`,
+    ],
+
+    text:
+      `${summary.totalHours} reported hours ` +
+      `across ${summary.customersWithReportedHours} customers ` +
+      `on ${summary.projectsWithReportedHours} projects ` +
+      `with ${summary.customerUtilization}% customer utilization.`,
+  };
+}
+
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader(
@@ -791,14 +798,62 @@ export default async function handler(req, res) {
       0
     );
 
-    return res.status(200).json({
-      version: "time-intelligence-api-v6",
+    const periodResponse = {
+      type: periodRange.type,
+      from: formatDate(periodRange.from),
+      to: formatDate(periodRange.to),
+    };
 
-      period: {
-        type: periodRange.type,
-        from: formatDate(periodRange.from),
-        to: formatDate(periodRange.to),
-      },
+    const summary = {
+      totalHours,
+
+      customerHours:
+        utilization.customerHours,
+
+      internalHours:
+        utilization.internalHours,
+
+      unknownHours:
+        utilization.unknownHours,
+
+      classifiedHours:
+        utilization.classifiedHours,
+
+      customerUtilization:
+        utilization.customerUtilization,
+
+      numberOfTimeEntries:
+        dailyEntries.length,
+
+      projectsWithReportedHours:
+        hoursByProject.length,
+
+      reportingCodesUsed:
+        hoursByReportingCode.length,
+
+      customersWithReportedHours:
+        hoursByCustomer.length,
+
+      entriesWithCustomerMapping:
+        mappedEntries.length,
+
+      entriesWithoutCustomerMapping:
+        dailyEntries.length -
+        mappedEntries.length,
+    };
+
+    const executiveBrief =
+      buildExecutiveBrief(
+        periodResponse,
+        summary
+      );
+
+    return res.status(200).json({
+      version: "time-intelligence-api-v7",
+
+      period: periodResponse,
+
+      executiveBrief,
 
       filters: {
         companyId: COMPANY_ID,
@@ -806,43 +861,7 @@ export default async function handler(req, res) {
         module: MODULE,
       },
 
-      summary: {
-        totalHours,
-
-        customerHours:
-          utilization.customerHours,
-
-        internalHours:
-          utilization.internalHours,
-
-        unknownHours:
-          utilization.unknownHours,
-
-        classifiedHours:
-          utilization.classifiedHours,
-
-        customerUtilization:
-          utilization.customerUtilization,
-
-        numberOfTimeEntries:
-          dailyEntries.length,
-
-        projectsWithReportedHours:
-          hoursByProject.length,
-
-        reportingCodesUsed:
-          hoursByReportingCode.length,
-
-        customersWithReportedHours:
-          hoursByCustomer.length,
-
-        entriesWithCustomerMapping:
-          mappedEntries.length,
-
-        entriesWithoutCustomerMapping:
-          dailyEntries.length -
-          mappedEntries.length,
-      },
+      summary,
 
       dailyHours,
       hoursByCustomer,
@@ -877,7 +896,7 @@ export default async function handler(req, res) {
     );
 
     return res.status(500).json({
-      version: "time-intelligence-api-v6",
+      version: "time-intelligence-api-v7",
       error: "Failed to generate dashboard data",
       details:
         error instanceof Error
