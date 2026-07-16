@@ -399,7 +399,7 @@ export default async function handler(req, res) {
       summary: {
         totalHours,
         numberOfTimeEntries: dailyEntries.length,
-        activeProjects: hoursByProject.length,
+        projectsWithReportedHours: hoursByProject.length,
         reportingCodesUsed:
           hoursByReportingCode.length,
       },
