@@ -5,7 +5,7 @@ const {
 } = process.env;
 
 const COMPANY_ID = "10";
-const EMP_NO = "1045";
+//const EMP_NO = "1045";
 const MODULE = "PRJREP";
 
 const IFS_PROJECTION_BASE_URL =
@@ -857,7 +857,7 @@ export default async function handler(req, res) {
 
       filters: {
         companyId: COMPANY_ID,
-        employeeId: EMP_NO,
+      //  employeeId: EMP_NO,
         module: MODULE,
       },
 
