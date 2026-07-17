@@ -154,7 +154,7 @@ function buildTimeUrl(monday) {
     `${IFS_PROJECTION_BASE_URL}/` +
     "TimeRegistrationEmployeeHandling.svc/TimmanJobTranses" +
     `?$filter=Module eq '${MODULE}'` +
-    ` and EmpNo eq '${EMP_NO}'` +
+   // ` and EmpNo eq '${EMP_NO}'` +
     ` and CompanyId eq '${COMPANY_ID}'` +
     ` and year(AccountDate) eq ${year}` +
     ` and month(AccountDate) eq ${month}` +
