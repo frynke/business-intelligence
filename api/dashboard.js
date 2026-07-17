@@ -5,7 +5,7 @@ const {
 } = process.env;
 
 const COMPANY_ID = "10";
-//const EMP_NO = "1045";
+const EMP_NO = "1045";
 const MODULE = "PRJREP";
 
 const IFS_PROJECTION_BASE_URL =
